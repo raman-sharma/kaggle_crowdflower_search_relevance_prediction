@@ -1,0 +1,313 @@
+%matplotlib inline
+
+import pandas as pd
+import numpy as np
+from itertools import islice
+from operator import itemgetter
+from sklearn.preprocessing import LabelEncoder
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import FeatureUnion
+from sklearn.pipeline import Pipeline
+from numpy.core.multiarray import ndarray
+from sklearn.cross_validation import cross_val_score
+import matplotlib.pyplot as plt
+from datetime import date, time
+from datetime import datetime
+
+from datetime import timedelta
+from pandas.tseries.tools import to_datetime
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import LabelEncoder
+from collections import Counter,defaultdict
+import math
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from bs4 import BeautifulSoup
+
+from sklearn.decomposition import TruncatedSVD
+import nltk
+from sklearn.base import BaseEstimator
+from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
+from sklearn.feature_selection import SelectKBest, chi2
+from sklearn import metrics, ensemble, linear_model, svm
+from numpy import log, ones, array, zeros, mean, std, repeat
+import scipy.sparse as sp
+from time import time
+from sklearn.cross_validation import StratifiedKFold,train_test_split,KFold
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
+from nltk.stem import LancasterStemmer,SnowballStemmer,PorterStemmer
+import re
+from collections import Counter
+import string
+from nltk.corpus import brown
+#nltk.download()
+from nltk.corpus import stopwords
+from nltk.tokenize import RegexpTokenizer
+from collections import OrderedDict
+import itertools
+from sklearn import decomposition, pipeline, metrics, grid_search
+import collections
+
+pd.set_option('display.width', 500)
+pd.set_option('display.max_columns', 30)
+
+# set some nicer defaults for matplotlib
+from matplotlib import rcParams
+from nltk import word_tokenize
+
+
+rcParams['figure.figsize'] = (10, 6)
+rcParams['figure.dpi'] = 150
+#rcParams['axes.color_cycle'] = dark2_colors
+rcParams['lines.linewidth'] = 2
+rcParams['axes.grid'] = False
+rcParams['axes.facecolor'] = 'white'
+rcParams['font.size'] = 14
+rcParams['patch.edgecolor'] = 'none'
+
+#Quadritic Weighted Kappa
+def confusion_matrix(rater_a, rater_b, min_rating=None, max_rating=None):
+    """
+    Returns the confusion matrix between rater's ratings
+    """
+    assert(len(rater_a) == len(rater_b))
+    if min_rating is None:
+        min_rating = min(rater_a + rater_b)
+    if max_rating is None:
+        max_rating = max(rater_a + rater_b)
+    num_ratings = int(max_rating - min_rating + 1)
+    conf_mat = [[0 for i in range(num_ratings)]
+                for j in range(num_ratings)]
+    for a, b in zip(rater_a, rater_b):
+        conf_mat[a - min_rating][b - min_rating] += 1
+    return conf_mat
+
+
+def histogram(ratings, min_rating=None, max_rating=None):
+    """
+    Returns the counts of each type of rating that a rater made
+    """
+    if min_rating is None:
+        min_rating = min(ratings)
+    if max_rating is None:
+        max_rating = max(ratings)
+    num_ratings = int(max_rating - min_rating + 1)
+    hist_ratings = [0 for x in range(num_ratings)]
+    for r in ratings:
+        hist_ratings[r - min_rating] += 1
+    return hist_ratings
+
+
+def quadratic_weighted_kappa(y, y_pred):
+    """
+    Calculates the quadratic weighted kappa
+    axquadratic_weighted_kappa calculates the quadratic weighted kappa
+    value, which is a measure of inter-rater agreement between two raters
+    that provide discrete numeric ratings.  Potential values range from -1
+    (representing complete disagreement) to 1 (representing complete
+    agreement).  A kappa value of 0 is expected if all agreement is due to
+    chance.
+    quadratic_weighted_kappa(rater_a, rater_b), where rater_a and rater_b
+    each correspond to a list of integer ratings.  These lists must have the
+    same length.
+    The ratings should be integers, and it is assumed that they contain
+    the complete range of possible ratings.
+    quadratic_weighted_kappa(X, min_rating, max_rating), where min_rating
+    is the minimum possible rating, and max_rating is the maximum possible
+    rating
+    """
+    rater_a = y
+    rater_b = y_pred
+    min_rating=None
+    max_rating=None
+    rater_a = np.array(rater_a, dtype=int)
+    rater_b = np.array(rater_b, dtype=int)
+    assert(len(rater_a) == len(rater_b))
+    if min_rating is None:
+        min_rating = min(min(rater_a), min(rater_b))
+    if max_rating is None:
+        max_rating = max(max(rater_a), max(rater_b))
+    conf_mat = confusion_matrix(rater_a, rater_b,
+                                min_rating, max_rating)
+    num_ratings = len(conf_mat)
+    num_scored_items = float(len(rater_a))
+
+    hist_rater_a = histogram(rater_a, min_rating, max_rating)
+    hist_rater_b = histogram(rater_b, min_rating, max_rating)
+
+    numerator = 0.0
+    denominator = 0.0
+
+    for i in range(num_ratings):
+        for j in range(num_ratings):
+            expected_count = (hist_rater_a[i] * hist_rater_b[j]
+                              / num_scored_items)
+            d = pow(i - j, 2.0) / pow(num_ratings - 1, 2.0)
+            numerator += d * conf_mat[i][j] / num_scored_items
+            denominator += d * expected_count / num_scored_items
+
+    return (1.0 - numerator / denominator)
+#Add extra features to the dataframe  
+def extractCountsOfQueryInProductData(data):
+    token_pattern = re.compile(r"(?u)\b\w\w+\b")
+    data["query_tokens_in_title"] = 0.0
+    data["query_tokens_in_description"] = 0.0
+
+    for i, row in data.iterrows():
+        list1 = []
+        query = set(x.lower() for x in token_pattern.findall(row["query"]))
+        title = set(x.lower() for x in token_pattern.findall(row["product_title"]))
+        description = set(x.lower() for x in token_pattern.findall(row["product_description"]))
+        if len(title) > 0:
+            data.set_value(i, "query_tokens_in_title", len(query.intersection(title))/float(len(title)))
+        if len(description) > 0:
+            data.set_value(i, "query_tokens_in_description", len(query.intersection(description))/float(len(description)))
+    appended_data = list(data.apply(lambda x:'%s %s %s' % (x['query'],x['product_title'], x['product_description']),axis=1))
+    n_words = [len(c.split()) for c in appended_data]
+    n_chars = [len(c) for c in appended_data]
+    data['countOfWordsInAllFields'] = n_words
+    data['countOfCharsInAllFields'] = n_chars
+    
+ 
+#Load Data
+train = pd.read_csv("train.csv").fillna("")
+test = pd.read_csv("test.csv").fillna("")
+#Add fields for count of number of query tokens in product title and product description
+extractCountsOfQueryInProductData(train)
+extractCountsOfQueryInProductData(test)
+#no need for id columns
+idx = test.id.values.astype(int)
+train = train.drop('id', axis=1)
+test = test.drop('id', axis=1)
+# create labels. drop useless columns
+y = train.median_relevance.values
+train = train.drop(['median_relevance', 'relevance_variance'], axis=1)
+
+
+#####################Building Model using Tf-Idf features for char and word n-grams and some Extra features####################
+
+#The stemming routine..to be used in tokenizer
+stemmer = PorterStemmer()
+def stem_tokens(tokens, stemmer):
+    stemmed = []
+    for item in tokens:
+        stemmed.append(stemmer.stem(item))
+    return stemmed
+#Tokenizer routine
+def tokenize(text):
+    text = "".join([ch for ch in text if ch not in string.punctuation])
+    tokens = nltk.word_tokenize(text)
+    stems = stem_tokens(tokens, stemmer)
+    return stems
+
+def preprocess(f):
+    f = [x.lower() for x in f]
+    f = [x.replace("\n"," ") for x in f]        
+    f = [x.replace("\t"," ") for x in f]       
+    #f = [x.replace("\xa0"," ") for x in f]
+    f = [x.replace("won't", "will not") for x in f]
+    f = [x.replace("can't", "cannot") for x in f]
+    f = [x.replace("i'm", "i am") for x in f]
+    f = [x.replace(" im ", " i am ") for x in f]
+    f = [x.replace("'ll", " will") for x in f]
+    f = [x.replace("'t", " not") for x in f]
+    f = [x.replace("'ve", " have") for x in f]
+    f = [x.replace("'s", " is") for x in f]
+    f = [x.replace("'re", " are") for x in f]
+    f = [x.replace("'d", " would") for x in f]
+    f = [re.sub(r'[0-9]*\.?[0-9]+',r' number ',x).strip() for x in f]
+    f = [re.sub(r'[*$%&#@]+',r' xexp ',x).strip() for x in f]
+    f = [BeautifulSoup(x).get_text(separator=" ") for x in f]
+    return f
+
+
+#Merges the query,product title and product description
+class queryProductDetailsCombiner(BaseEstimator,TransformerMixin):
+    def fit(self, x, y=None):
+        return self
+    def transform(self,dfData):
+        listQueryProductDetails = []
+        #for i,row in dfData.iterrows():
+        listQueryProductDetails = dfData.apply(lambda x:'%s %s %s' % (x['query'],x['product_title'], x['product_description']),axis=1)
+        #listQueryProductDetails = preprocess(listQueryProductDetails)
+        arrayQueryProductDetails = np.asarray(listQueryProductDetails).astype(str)
+        return arrayQueryProductDetails
+    
+    
+#Extracts column out of the data Frame and returns as a numpy array   
+class ColumnExtractor(BaseEstimator,TransformerMixin):
+    def __init__(self, columns=[]):
+        self.columns = columns
+
+    def fit_transform(self, X, y=None, **fit_params):
+        self.fit(X, y, **fit_params)
+        return self.transform(X)
+
+    def transform(self, X, **transform_params):
+        return np.asarray(X[self.columns])
+
+    def fit(self, X, y=None, **fit_params):
+        return self
+  
+tfIdf1 = Pipeline([
+                ('queryProductDetailsMerged',queryProductDetailsCombiner()),  
+                ('Vectorizer',TfidfVectorizer(min_df=3,ngram_range=(3,5),strip_accents='unicode', analyzer='word',
+                                              token_pattern=r'\w{1,}',use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words = 'english')),
+                ('svd', TruncatedSVD()),
+                ('Scaling',StandardScaler())
+                ])
+tfIdf2 = Pipeline([
+                ('queryProductDetailsMerged',queryProductDetailsCombiner()),  
+                ('Vectorizer',TfidfVectorizer(min_df=3,ngram_range=(3,5),strip_accents='unicode', analyzer='char',
+                                              token_pattern=r'\w{1,}',use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words = 'english')),
+                ('svd', TruncatedSVD()),
+                ('Scaling',StandardScaler())
+                ])
+otherFeatures = Pipeline([
+                        ('countQueryInProductTitle',ColumnExtractor(['query_tokens_in_title','query_tokens_in_description',
+                                                                    'countOfWordsInAllFields','countOfCharsInAllFields'])),
+                        ('Scaling2',StandardScaler())
+                        ])
+combined_features = FeatureUnion([("tfIdf1",tfIdf1),
+                                  ("tfIdf2",tfIdf2),
+                                  ("otherFeatures",otherFeatures)])
+                                                           
+svm = SVC()
+
+pipeline = Pipeline([("features",combined_features),("svm",svm)])
+                    
+param_grid1 = dict(features__tfIdf1__svd__n_components=[300],
+                   features__tfIdf2__svd__n_components=[270],
+                  svm__C=[6])
+
+kappa_scorer = metrics.make_scorer(quadratic_weighted_kappa, greater_is_better = True)
+
+# Initialize Grid Search Model
+model4 = grid_search.GridSearchCV(estimator = pipeline, param_grid=param_grid1, scoring=kappa_scorer,
+                                 verbose=10, iid=True, refit=True, cv=3)
+# Fit Grid Search Model
+model4.fit(train, y)
+print("Best score: %0.3f" % model4.best_score_)
+print("Best parameters set:")
+best_parameters = model4.best_estimator_.get_params()
+for param_name in sorted(param_grid1.keys()):
+	print("\t%s: %r" % (param_name, best_parameters[param_name]))
+
+###############Finally creating submission file#################
+#This is used when I have to use the model with best score without caring for deviation in score..
+# Get best model
+#best_model = model4.best_estimator_
+
+#This is used after examining the sross val scores and std.deviations and I chose the model with with good score and less std.devation.
+best_model = pipeline.set_params(features__tfIdf1__svd__n_components=300,features__tfIdf2__svd__n_components=270,svm__C=6)
+cv1 = StratifiedKFold(y,3)
+scores = cross_val_score(pipeline,train,y,cv=cv1,scoring=kappa_scorer)
+#Fit model with best parameters optimized for quadratic_weighted_kappa
+best_model.fit(train,y)
+preds = best_model.predict(test)
+
+# Create your first submission file
+submission = pd.DataFrame({"id": idx, "prediction": preds})
+submission.to_csv("Model4_word_char_grams_extra_features.csv", index=False)
