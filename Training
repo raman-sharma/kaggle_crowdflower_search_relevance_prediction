@@ -3,20 +3,37 @@
 import pandas as pd
 import numpy as np
 from itertools import islice
+
 from operator import itemgetter
 from sklearn.preprocessing import LabelEncoder
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import FeatureUnion
 from sklearn.pipeline import Pipeline
 from numpy.core.multiarray import ndarray
+from sklearn.feature_extraction import text
 from sklearn.cross_validation import cross_val_score
 import matplotlib.pyplot as plt
+from sklearn.feature_selection import SelectKBest, chi2,SelectPercentile
+
+from nltk.corpus import wordnet as wn
+from nltk.stem.wordnet import WordNetLemmatizer
+import gensim, logging
+from gensim.models import word2vec
+import nltk.data
+import logging
+from sklearn.ensemble import GradientBoostingClassifier
+from nltk.corpus import brown
+import cPickle
 from datetime import date, time
-from datetime import datetime
 
 from datetime import timedelta
 from pandas.tseries.tools import to_datetime
+
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.neighbors.dist_metrics import DistanceMetric
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import jaccard_similarity_score
+
 from sklearn.preprocessing import LabelEncoder
 from collections import Counter,defaultdict
 import math
@@ -30,7 +47,10 @@ from sklearn.base import BaseEstimator
 from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer
 from sklearn.feature_selection import SelectKBest, chi2
 from sklearn import metrics, ensemble, linear_model, svm
-from numpy import log, ones, array, zeros, mean, std, repeat
+from numpy import log, ones, array, zeros, mean, std
+
+
+
 import scipy.sparse as sp
 from time import time
 from sklearn.cross_validation import StratifiedKFold,train_test_split,KFold
@@ -56,16 +76,6 @@ pd.set_option('display.max_columns', 30)
 # set some nicer defaults for matplotlib
 from matplotlib import rcParams
 from nltk import word_tokenize
-
-
-rcParams['figure.figsize'] = (10, 6)
-rcParams['figure.dpi'] = 150
-#rcParams['axes.color_cycle'] = dark2_colors
-rcParams['lines.linewidth'] = 2
-rcParams['axes.grid'] = False
-rcParams['axes.facecolor'] = 'white'
-rcParams['font.size'] = 14
-rcParams['patch.edgecolor'] = 'none'
 
 #Quadritic Weighted Kappa
 def confusion_matrix(rater_a, rater_b, min_rating=None, max_rating=None):
@@ -101,23 +111,6 @@ def histogram(ratings, min_rating=None, max_rating=None):
 
 
 def quadratic_weighted_kappa(y, y_pred):
-    """
-    Calculates the quadratic weighted kappa
-    axquadratic_weighted_kappa calculates the quadratic weighted kappa
-    value, which is a measure of inter-rater agreement between two raters
-    that provide discrete numeric ratings.  Potential values range from -1
-    (representing complete disagreement) to 1 (representing complete
-    agreement).  A kappa value of 0 is expected if all agreement is due to
-    chance.
-    quadratic_weighted_kappa(rater_a, rater_b), where rater_a and rater_b
-    each correspond to a list of integer ratings.  These lists must have the
-    same length.
-    The ratings should be integers, and it is assumed that they contain
-    the complete range of possible ratings.
-    quadratic_weighted_kappa(X, min_rating, max_rating), where min_rating
-    is the minimum possible rating, and max_rating is the maximum possible
-    rating
-    """
     rater_a = y
     rater_b = y_pred
     min_rating=None
@@ -149,13 +142,14 @@ def quadratic_weighted_kappa(y, y_pred):
             denominator += d * expected_count / num_scored_items
 
     return (1.0 - numerator / denominator)
-#Add extra features to the dataframe  
+
 def extractCountsOfQueryInProductData(data):
     token_pattern = re.compile(r"(?u)\b\w\w+\b")
     data["query_tokens_in_title"] = 0.0
     data["query_tokens_in_description"] = 0.0
-
+    data["title_tokens_in_description"] = 0.0
     for i, row in data.iterrows():
+        #data.product_description[i] = BeautifulSoup(data.product_description[i]).get_text(" ")
         list1 = []
         query = set(x.lower() for x in token_pattern.findall(row["query"]))
         title = set(x.lower() for x in token_pattern.findall(row["product_title"]))
@@ -164,16 +158,107 @@ def extractCountsOfQueryInProductData(data):
             data.set_value(i, "query_tokens_in_title", len(query.intersection(title))/float(len(title)))
         if len(description) > 0:
             data.set_value(i, "query_tokens_in_description", len(query.intersection(description))/float(len(description)))
-    appended_data = list(data.apply(lambda x:'%s %s %s' % (x['query'],x['product_title'], x['product_description']),axis=1))
+        if len(description)>0:
+            data.set_value(i, "title_tokens_in_description", len(title.intersection(description))/float(len(description)))
+    appended_data = list(data.apply(lambda x:'%s %s %s' % (x['query'].decode("ascii","ignore"),x['product_title'].decode("ascii","ignore"), x['product_description'].decode("ascii","ignore")),axis=1))
     n_words = [len(c.split()) for c in appended_data]
     n_chars = [len(c) for c in appended_data]
     data['countOfWordsInAllFields'] = n_words
     data['countOfCharsInAllFields'] = n_chars
     
+from nltk import bigrams
+import difflib
+
+#Correct Spelling Mistakes in Query
+
+def build_query_correction_map(print_different=True):
+    train = pd.read_csv('train.csv').fillna('')
+    test  = pd.read_csv("test.csv").fillna("")
+    # get all query
+    queries = set(train['query'].values)
+    correct_map = {}
+    if print_different:
+        print("%30s \t %30s"%('original query','corrected query'))
+    for q in queries:
+        corrected_q = autocorrect_query(q,train=train,test=test,warning_on=False)
+        if print_different and q != corrected_q:
+            print ("%30s \t %30s"%(q,corrected_q))
+        correct_map[q] = corrected_q.decode("ascii","ignore")
+    return correct_map
+
+def autocorrect_query(query,train=None,test=None,cutoff=0.8,warning_on=True):
+    """
+    autocorrect a query based on the training set
+    """	
+    if train is None:
+        train = pd.read_csv('../input/train.csv').fillna('')
+    if test is None:
+        test = pd.read_csv('../input/test.csv').fillna('')
+    train_data = train.values[train['query'].values==query,:]
+    test_data = test.values[test['query'].values==query,:]
+    s = ""
+    for r in train_data:
+        s = "%s %s %s"%(s,BeautifulSoup(r[2]).get_text(" ",strip=True),BeautifulSoup(r[3]).get_text(" ",strip=True))
+    for r in test_data:
+        s = "%s %s %s"%(s,BeautifulSoup(r[2]).get_text(" ",strip=True),BeautifulSoup(r[3]).get_text(" ",strip=True))
+    s = re.findall(r'[\'\"\w]+',s.lower())
+    s_bigram = [' '.join(i) for i in bigrams(s)]
+    s.extend(s_bigram)
+    corrected_query = []
+    for q in query.lower().split():
+        if len(q)<=2:
+            corrected_query.append(q)
+            continue
+        corrected_word = difflib.get_close_matches(q, s,n=1,cutoff=cutoff)
+        if len(corrected_word) >0:
+            corrected_query.append(corrected_word[0])
+        else :
+            if warning_on:
+                print ("WARNING: cannot find matched word for '%s' -> used the original word"%(q))
+            corrected_query.append(q)
+    return ' '.join(corrected_query)
+    
  
 #Load Data
 train = pd.read_csv("train.csv").fillna("")
 test = pd.read_csv("test.csv").fillna("")
+
+
+##############spell correct queries################
+query_map = build_query_correction_map()
+
+train_query = train['query'].map(query_map)
+train['query'] = train_query
+train['query'] = train['query'].apply(lambda x: x.decode("ascii","ignore"))
+
+test_query = test['query'].map(query_map)
+test['query'] = test_query
+test['query'] = test['query'].apply(lambda x: x.decode("ascii","ignore"))
+
+
+
+# Add labels for each query
+le = LabelEncoder()
+train_query = le.fit_transform(train['query'])
+test_query = le.transform(test['query'])
+train['query_id'] = train_query
+test['query_id'] = test_query
+
+def get_count(values):
+    return len(values)
+
+#1-way count feature for different training queries
+grouped_count1 = train.groupby('query').query.agg(get_count)
+train['query_counts'] = train['query'].map(grouped_count1)
+
+#1-way count feature for different training queries
+grouped_count2 = test.groupby('query').query.agg(get_count)
+test['query_counts'] = test['query'].map(grouped_count2)
+
+#delete query_id columns
+train = train.drop('query_id',1)
+test = test.drop('query_id',1)
+
 #Add fields for count of number of query tokens in product title and product description
 extractCountsOfQueryInProductData(train)
 extractCountsOfQueryInProductData(test)
@@ -181,14 +266,69 @@ extractCountsOfQueryInProductData(test)
 idx = test.id.values.astype(int)
 train = train.drop('id', axis=1)
 test = test.drop('id', axis=1)
+
+#train = train[train.relevance_variance<1.43]
+
 # create labels. drop useless columns
 y = train.median_relevance.values
+
 train = train.drop(['median_relevance', 'relevance_variance'], axis=1)
 
+##########################Function For Word2Vec ##########################                  
+                   
+                   
+############################ Combined Data For Training Word2Vec Model ###################
+combined_data_train = list(train.apply(
+            lambda x: '%s. %s. %s' % (x['query'].decode("ascii","ignore"),x['product_title'].decode("ascii","ignore"),
+                                      x['product_description'].decode("ascii","ignore")),axis=1))
+combined_data_test = list(test.apply(
+            lambda x: '%s. %s. %s' % (x['query'].decode("ascii","ignore"),x['product_title'].decode("ascii","ignore"), 
+                                      x['product_description'].decode("ascii","ignore")),axis=1))
+############################################ Helper Functions#############################
 
-#####################Building Model using Tf-Idf features for char and word n-grams and some Extra features####################
+def LambdaMagic_to_words(combined_text):
+    combined_text = BeautifulSoup(combined_text).get_text()
+    tokens = re.findall(r'\w{1,}',combined_text)
+    tokens = [re.sub(r'[0-9]*\.?[0-9]+',r' number ',x).strip() for x in tokens]
+    tokens = [re.sub(r'[*$%&#@]+',r' xexp ',x).strip() for x in tokens]
+    tokens = [tok.lower() for tok in tokens if len(tok)>1]
+    return tokens # a list of words
 
-#The stemming routine..to be used in tokenizer
+def product_to_sentences(lambdaMagicData, tokenizer, remove_stopwords=False ):
+    lambdaMagicData = lambdaMagicData.decode("ascii", "ignore")
+    raw_sentences = tokenizer.tokenize(lambdaMagicData.strip())
+    sentences = []
+    for raw_sentence in raw_sentences:
+        # If a sentence is empty, skip it
+        if len(raw_sentence) > 0:
+            # Otherwise, call review_to_wordlist to get a list of words
+            sentences.append( LambdaMagic_to_words( raw_sentence))
+    return sentences
+
+###################Generating Sentences For Word2Vec Training############################
+
+sentences = []  # Initialize an empty list of sentences
+tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+print "Parsing sentences from training set"
+for queryProductInfo in combined_data_train:
+    sentences += product_to_sentences(queryProductInfo, tokenizer)
+
+print "Parsing sentences from unlabeled set"
+for queryProductInfo in combined_data_test:
+    sentences += product_to_sentences(queryProductInfo, tokenizer)
+    
+##################### Word2Vec Model#################################################### 
+
+num_features = 800   # Word vector dimensionality                      
+min_word_count = 5   # Minimum word count                        
+num_workers = 4       # Number of threads to run in parallel
+#context = 10          # Context window size                                                                                    
+#downsampling = 1e-3   # Downsample setting for frequent words
+model = word2vec.Word2Vec(sentences, workers=num_workers, \
+            size=num_features, min_count = min_word_count)
+
+#################Training Model####################
+###################################################
 stemmer = PorterStemmer()
 def stem_tokens(tokens, stemmer):
     stemmed = []
@@ -203,10 +343,11 @@ def tokenize(text):
     return stems
 
 def preprocess(f):
+    l = []
     f = [x.lower() for x in f]
     f = [x.replace("\n"," ") for x in f]        
-    f = [x.replace("\t"," ") for x in f]       
-    #f = [x.replace("\xa0"," ") for x in f]
+    f = [x.replace("\t"," ") for x in f]        
+
     f = [x.replace("won't", "will not") for x in f]
     f = [x.replace("can't", "cannot") for x in f]
     f = [x.replace("i'm", "i am") for x in f]
@@ -217,13 +358,163 @@ def preprocess(f):
     f = [x.replace("'s", " is") for x in f]
     f = [x.replace("'re", " are") for x in f]
     f = [x.replace("'d", " would") for x in f]
-    f = [re.sub(r'[0-9]*\.?[0-9]+',r' number ',x).strip() for x in f]
-    f = [re.sub(r'[*$%&#@]+',r' xexp ',x).strip() for x in f]
-    f = [BeautifulSoup(x).get_text(separator=" ") for x in f]
+    
+    f = [re.subn("ies( |$)", "y ", x)[0].strip() for x in f]
+    f = [re.subn("s( |$)", " ", x)[0].strip() for x in f]
+    f = [re.subn("ing( |$)", " ", x)[0].strip() for x in f]
     return f
+######################## Main Classes ###########################    
+class word2VecVectors(BaseEstimator,TransformerMixin):
+    def __init__(self,model):
+        self.model = model
+    def fit(self,X,y=None,**fit_params):
+        return self
+    def transform(self,dataFrame,**fit_params):
+        text = list(dataFrame.apply(
+            lambda x: '%s %s %s' % (x['query'].decode("ascii","ignore"),x['product_title'].decode("ascii","ignore"), 
+                                    x['product_description'].decode("ascii","ignore")),axis=1))
+        clean_text = []
+        for product_data in text:
+            clean_text.append( LambdaMagic_to_words(product_data))
+        dataVecs = getAvgFeatureVecs( clean_text, model,300)  
+        return dataVecs
+        
+def makeFeatureVec(words, model, num_features):
+    featureVec = np.zeros((num_features,),dtype="float32")
+    nwords = 0.
+    index2word_set = set(model.index2word)
+    for word in words:
+        if word in index2word_set: 
+            nwords = nwords + 1.
+            featureVec = np.add(featureVec,model[word])
+    featureVec = np.divide(featureVec,nwords)
+    return featureVec
+    
+def getAvgFeatureVecs(reviews, model, num_features):
+    counter = 0.
+    reviewFeatureVecs = np.zeros((len(reviews),num_features),dtype="float32")
+    for review in reviews:
+        if counter%1000. == 0.:
+            print "Review %d of %d" % (counter, len(reviews))
+        reviewFeatureVecs[counter] = makeFeatureVec(review, model,num_features)
+        counter = counter + 1.
+    return reviewFeatureVecs    
+################################ Word2Vec Classes #############################################
 
+class Word2VecDistFeatures(BaseEstimator,TransformerMixin):
+    def __init__(self,model):
+        #self.num_features = num_features    # Word vector dimensionality                      
+        self.model = model
+        #self.scaler = StanderdScaler()
 
-#Merges the query,product title and product description
+    def fit(self, X, y=None,**fit_params):
+        return self
+    
+    def transform(self,dataFrame,**fit_params):
+        query_data = list(dataFrame.apply(lambda x: '%s' % (x['query'].decode("ascii","ignore")),axis=1))
+        product_title_data = list(dataFrame.apply(lambda x: '%s' % (x['product_title'].decode("ascii","ignore")),axis=1))
+        product_description_data = list(dataFrame.apply(lambda x: '%s' % (x['product_description'].decode("ascii","ignore")),axis=1))
+        ###################### distinct query tokens #######################
+        
+        query_tokens = []
+        for q in query_data:
+            tokens = LambdaMagic_to_words(q)
+            for tok in tokens:
+                query_tokens.append(tok)
+        query_tokens_distinct = set(query_tokens)
+        
+        ###############tokenize data and make a list of Lists###############
+        
+        query_tokens = []
+        product_title_tokens = []
+        product_description_tokens = []
+        for qd in query_data:
+            query_tokens.append(LambdaMagic_to_words(qd))
+        for ptd in product_title_data:
+            product_title_tokens.append(LambdaMagic_to_words(ptd))
+        for pdd in product_description_data:
+            product_description_tokens.append(LambdaMagic_to_words(pdd))
+            
+        ############## Make A Set Of Distinct Query Tokens ####################
+        
+        query_tokens_distinct = []
+        for q in query_tokens:
+            for tok in q:
+                query_tokens_distinct.append(tok)
+        query_tokens_distinct = set(query_tokens_distinct)
+        
+        ############### Dictionary Of Most Similar 100 Words For Each Query Tokens ###############
+        
+        query_similar_words_dict = {}
+        for tok in query_tokens_distinct:
+            query_similar_words_dict[tok] = self.model.most_similar(tok,topn=200)
+            
+        ############### Similar tokens and similarity in Query and Product Titles ################################
+        
+        query_product_title_similar_set = []
+        query_product_title_similar_distance_set = []
+        for i in xrange(len(query_tokens)):
+            l1 = []
+            l2 = []
+            query_tok = query_tokens[i]
+            product_title_tok = product_title_tokens[i]
+            for tok in query_tok:
+                if tok in product_title_tok:
+                    l1.append(tok)
+                    l2.append(1)
+            for tok in query_tok:
+                a = query_similar_words_dict[tok]
+                for i in a:
+                    if i[0] in product_title_tok:
+                        l1.append(i[0])
+                        l2.append(i[1])
+            query_product_title_similar_set.append(l1)
+            query_product_title_similar_distance_set.append(l2)
+        
+        ############### Similar tokens and similarity in Query and Product Description ################################
+        
+        query_product_description_similar_set = []
+        query_product_description_similar_distance_set = []
+        for i in xrange(len(query_tokens)):
+            l1 = []
+            l2 = []
+            query_tok = query_tokens[i]
+            product_description_tok = product_description_tokens[i]
+            for tok in query_tok:
+                if tok in product_description_tok:
+                    l1.append(tok)
+                    l2.append(1)
+            for tok in query_tok:
+                a = query_similar_words_dict[tok]
+                for i in a:
+                    if i[0] in product_description_tok:
+                        l1.append(i[0])
+                        l2.append(i[1])
+            query_product_description_similar_set.append(l1)
+            query_product_description_similar_distance_set.append(l2)
+        
+        ################### Calculating Final Similarity Scores ##########################
+        
+        #############between query and product titles ################
+        
+        similarity1 = []
+        similarity2 = []
+        for i in query_product_title_similar_distance_set:
+            k=0
+            for j in i:
+                k+= j**2
+            similarity1.append([np.sqrt(k)])        
+        ############## between query and product description #############
+        
+        for i in query_product_description_similar_distance_set:
+            k=0
+            for j in i:
+                k+= j**2
+            similarity2.append([np.sqrt(k)])            
+        ####################### return the final similarities as numpy array ################
+        return np.concatenate([np.asarray(similarity1),np.asarray(similarity2)],axis=1)
+    
+###################Merges the query,product title and product description##########################
 class queryProductDetailsCombiner(BaseEstimator,TransformerMixin):
     def fit(self, x, y=None):
         return self
@@ -233,10 +524,9 @@ class queryProductDetailsCombiner(BaseEstimator,TransformerMixin):
         listQueryProductDetails = dfData.apply(lambda x:'%s %s %s' % (x['query'],x['product_title'], x['product_description']),axis=1)
         #listQueryProductDetails = preprocess(listQueryProductDetails)
         arrayQueryProductDetails = np.asarray(listQueryProductDetails).astype(str)
-        return arrayQueryProductDetails
-    
-    
-#Extracts column out of the data Frame and returns as a numpy array   
+        return arrayQueryProductDetails    
+       
+#######################Extracts column out of the data Frame and returns as a numpy array##################### 
 class ColumnExtractor(BaseEstimator,TransformerMixin):
     def __init__(self, columns=[]):
         self.columns = columns
@@ -250,64 +540,203 @@ class ColumnExtractor(BaseEstimator,TransformerMixin):
 
     def fit(self, X, y=None, **fit_params):
         return self
+sw = []    
+stop_words = ['http','www','img','border',"px",'0','color','style','padding','table','font','inch','width','height','1','2','3','4','5','6','7','8','9']
+stop_words = text.ENGLISH_STOP_WORDS.union(stop_words)
+#######################LSA Mapper Class ####################################    
+class LsaMapper(BaseEstimator,TransformerMixin):
+    def __init__(self,n_components,analyzer,mn,mx):
+        self.n_components = n_components
+        self.analyzer = analyzer
+        self.mn = mn
+        self.mx = mx
+        self.tfv = TfidfVectorizer(min_df=3, max_features=None,
+                      strip_accents='unicode', analyzer=self.analyzer, token_pattern=r'\w{1,}',
+                      ngram_range=(self.mn , self.mx), smooth_idf=1, sublinear_tf=1,
+                      stop_words=stop_words)
+        self.svd = TruncatedSVD(n_components = self.n_components)
+        self.scl = StandardScaler()
+
+    
+
+    def fit(self, dataset,y=None):
+        combined_data = list(dataset.apply(
+            lambda x: '%s %s %s' % (x['query'].decode("ascii","ignore"),x['product_title'].decode("ascii","ignore")
+                                    ,x['product_description'].decode("ascii","ignore")),axis=1))
+        combined_data = preprocess(combined_data)
+        X = self.tfv.fit_transform(combined_data)
+        X = self.svd.fit_transform(X)
+        return self
+
+    def transform(self, dataset):
+        assert isinstance(dataset, pd.DataFrame)
+        prod_data = list(dataset.apply(
+            lambda x: '%s %s' % (x['product_title'].decode("ascii","ignore"), x['product_description'].decode("ascii","ignore")),
+            axis=1))
+        query_data = list(dataset.apply(lambda x: str(x['query'].decode("ascii","ignore")), axis=1))
+        prod_title = list(dataset.apply(lambda x: str(x['product_title'].decode("ascii","ignore")), axis=1))
+        prod_description = list(dataset.apply(lambda x: str(x['product_description'].decode("ascii","ignore")), axis=1))
+        
+        prod_data = preprocess(prod_data)
+        query_data = preprocess(query_data)
+        prod_title =preprocess(prod_title)
+        prod_description = preprocess(prod_description)
+        
+        X = self.tfv.transform(prod_data)
+        Q = self.tfv.transform(query_data)
+        T = self.tfv.transform(prod_title)
+        D = self.tfv.transform(prod_description)
+
+        X = self.svd.transform(X)
+        Q = self.svd.transform(Q)
+        T = self.svd.transform(T)
+        D = self.svd.transform(D)
+
+
+        return prepare_features(X, Q,T,D)
+
+    def fit_transform(self, X, y=None):
+        self.fit(X, y)
+        return self.transform(X)
+
+def prepare_features(X, Q,T,D):
+    assert isinstance(X, ndarray)
+    assert isinstance(Q, ndarray)
+    
+    #Euclidean Distance b/w Query and Product Details
+    dist = DistanceMetric.get_metric('euclidean')
+    assert isinstance(dist, DistanceMetric)
+    
+    pairwise_distance1 = dist.pairwise(Q,T)
+    assert isinstance(pairwise_distance1, ndarray)
+    diagonal1 = pairwise_distance1.diagonal()
+    assert isinstance(diagonal1, ndarray)
+    diagonal1 = np.reshape(diagonal1, (-1, 1))
+    
+    #Cosine Distance b/w Query and Product Details
+    pairwise_distance2 = dist.pairwise(Q,D)
+    assert isinstance(pairwise_distance2, ndarray)
+    diagonal2 = pairwise_distance2.diagonal()
+    assert isinstance(diagonal2, ndarray)
+    diagonal2 = np.reshape(diagonal2, (-1, 1))
+    
+    pairwise_distance3 = cosine_similarity(Q,T)
+    assert isinstance(pairwise_distance3, ndarray)
+    diagonal3 = pairwise_distance3.diagonal()
+    assert isinstance(diagonal3, ndarray)
+    diagonal3 = np.reshape(diagonal3, (-1, 1))
+    
+    pairwise_distance4 = cosine_similarity(Q,D)
+    assert isinstance(pairwise_distance4, ndarray)
+    diagonal4 = pairwise_distance4.diagonal()
+    assert isinstance(diagonal4, ndarray)
+    diagonal4 = np.reshape(diagonal4, (-1, 1))
+    
+    
+    return np.concatenate([ X,Q,
+                             #X - Q,
+                             diagonal1,
+                             diagonal2,
+                             diagonal3,
+                             diagonal4
+                         ], axis=1)
+
+
   
-tfIdf1 = Pipeline([
-                ('queryProductDetailsMerged',queryProductDetailsCombiner()),  
-                ('Vectorizer',TfidfVectorizer(min_df=3,ngram_range=(3,5),strip_accents='unicode', analyzer='word',
-                                              token_pattern=r'\w{1,}',use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words = 'english')),
-                ('svd', TruncatedSVD()),
-                ('Scaling',StandardScaler())
-                ])
-tfIdf2 = Pipeline([
-                ('queryProductDetailsMerged',queryProductDetailsCombiner()),  
-                ('Vectorizer',TfidfVectorizer(min_df=3,ngram_range=(3,5),strip_accents='unicode', analyzer='char',
-                                              token_pattern=r'\w{1,}',use_idf=1,smooth_idf=1,sublinear_tf=1,stop_words = 'english')),
-                ('svd', TruncatedSVD()),
-                ('Scaling',StandardScaler())
-                ])
-otherFeatures = Pipeline([
-                        ('countQueryInProductTitle',ColumnExtractor(['query_tokens_in_title','query_tokens_in_description',
-                                                                    'countOfWordsInAllFields','countOfCharsInAllFields'])),
+otherFeatures1 = Pipeline([
+                        ('countQueryInProductTitle',ColumnExtractor(['query_tokens_in_title',
+                                                                     'query_tokens_in_description',
+                                                                     'title_tokens_in_description',
+                                                                    #'countOfWordsInAllFields',
+                                                                    #'countOfCharsInAllFields',
+                                                                    #'query_counts'
+                                                                    ])),
                         ('Scaling2',StandardScaler())
                         ])
-combined_features = FeatureUnion([("tfIdf1",tfIdf1),
-                                  ("tfIdf2",tfIdf2),
-                                  ("otherFeatures",otherFeatures)])
+Word2VecFeatures = Pipeline([
+                            ("Word2VecDistFeatures",Word2VecDistFeatures(model)),
+                            ("Scaling2",StandardScaler())
+                            ])
+word2VecVectors = Pipeline([
+                            ("word2VecVectors",word2VecVectors(model)),
+                            ("Scaling2",StandardScaler())
+                            ])
+
+
+LsaWord = Pipeline([
+                    ("LSA",LsaMapper(300,'word',1,3)),  
+                    ("Scaling2",StandardScaler())
+                    ])
+LsaChar = Pipeline([
+                    ("LSA",LsaMapper(250,'char',3,5)),  
+                    ("Scaling2",StandardScaler())
+                    ])
+
+combined_features1 = FeatureUnion([("LsaWord",LsaWord),
+                                  #("LsaChar",LsaChar),
+                                  ("otherFeatures",otherFeatures1),
+                                  #("word2VecVectors",word2VecVectors),
+                                  ("Word2VecDistFeatures",Word2VecFeatures), 
+                                  ])
                                                            
 svm = SVC()
+gbc = GradientBoostingClassifier(n_estimators=1000)
 
-pipeline = Pipeline([("features",combined_features),("svm",svm)])
+pipeline1 = Pipeline([("features",combined_features1),("svm",svm)])
                     
-param_grid1 = dict(features__tfIdf1__svd__n_components=[300],
-                   features__tfIdf2__svd__n_components=[270],
-                  svm__C=[6])
-
+param_grid1 = dict(svm__C=[6])
 kappa_scorer = metrics.make_scorer(quadratic_weighted_kappa, greater_is_better = True)
 
-# Initialize Grid Search Model
-model4 = grid_search.GridSearchCV(estimator = pipeline, param_grid=param_grid1, scoring=kappa_scorer,
-                                 verbose=10, iid=True, refit=True, cv=3)
-# Fit Grid Search Model
-model4.fit(train, y)
-print("Best score: %0.3f" % model4.best_score_)
-print("Best parameters set:")
-best_parameters = model4.best_estimator_.get_params()
-for param_name in sorted(param_grid1.keys()):
-	print("\t%s: %r" % (param_name, best_parameters[param_name]))
+skf1 = StratifiedKFold(y,n_folds=3,random_state=42*5)
+skf2 = StratifiedKFold(train['query'],n_folds=3,random_state=56)
 
-###############Finally creating submission file#################
+# Initialize Grid Search Model
+model_imp1 = grid_search.GridSearchCV(estimator = pipeline1, param_grid=param_grid1, scoring=kappa_scorer,
+                                 verbose=10, iid=True, refit=True, cv=skf2)
+
+# Fit Grid Search Model
+model_imp1.fit(train,y)
+print("Best score: %0.3f" % model_imp1.best_score_)
+print("Best parameters set:")
+best_parameters1 = model_imp1.best_estimator_.get_params()
+for param_name in sorted(param_grid1.keys()):
+    print("\t%s: %r" % (param_name, best_parameters1[param_name]))
+    
 #This is used when I have to use the model with best score without caring for deviation in score..
 # Get best model
-#best_model = model4.best_estimator_
+best_model1 = model_imp1.best_estimator_
 
 #This is used after examining the sross val scores and std.deviations and I chose the model with with good score and less std.devation.
-best_model = pipeline.set_params(features__tfIdf1__svd__n_components=300,features__tfIdf2__svd__n_components=270,svm__C=6)
-cv1 = StratifiedKFold(y,3)
-scores = cross_val_score(pipeline,train,y,cv=cv1,scoring=kappa_scorer)
+best_model1 = pipeline1.set_params(svm__C=6)
 #Fit model with best parameters optimized for quadratic_weighted_kappa
-best_model.fit(train,y)
-preds = best_model.predict(test)
+
+best_model1.fit(train,y)
+preds = best_model1.predict(test)
+
 
 # Create your first submission file
 submission = pd.DataFrame({"id": idx, "prediction": preds})
-submission.to_csv("Model4_word_char_grams_extra_features.csv", index=False)
+submission.to_csv("_______Word_300_Char_250_Day_4_1.csv", index=False)
+
+#####################Ensembling The Best Predictions####################
+#individual submission files
+sub1 = pd.read_csv("1_______Word_300_Char_250_Day_4_2.csv",names=['id','preds1'])
+sub2 = pd.read_csv("2_______Word_300_Char_250_Day_4_1.csv",names=['id','preds2'])
+sub4 = pd.read_csv("4_______Word_300_Char_250_Day_3_3.csv",names=['id','preds4'])
+sub6 = pd.read_csv("6_______Word_300_Char_250_Day_3_1.csv",names=['id','preds6'])
+sub10= pd.read_csv("10______Model_Scaled_new_WordChar_Proc_______Word_300_Char_250_Day_30_2.csv",names=['id','preds10'])
+sub13 = pd.read_csv("13____Model_Scaled_new_WordChar_Proc_______Word_300_Char_250_Day_28_1.csv",names=['id','preds13'])
+sub16 = pd.read_csv("16___Model_Scaled_new_WordChar_Proc_______Word_300_Char_250_Day_27_1.csv",names=['id','preds16'])
+sub33 = pd.read_csv("33______hegde_Scaled_new_WordChar_200.csv",names=['id','preds33'])
+sub39 = pd.read_csv("39____Model_Scaled_new_Word_C_6.csv",names=['id','preds39'])
+
+#ensembling with weights for less correlated models
+idx = test.id.values.astype(int)
+sub6 = sub6.drop(sub6.index[[0]])
+sub33 = sub33.drop(sub33.index[[0]])
+sub4 = sub4.drop(sub4.index[[0]])
+sub39 = sub39.drop(sub39.index[[0]])
+preds = (sub6['preds6'].values.astype(float)*0.6 + sub39['preds39'].values.astype(float)*0.4).tolist()
+pred = [int(math.floor(x)) for x in preds]
+submission = pd.DataFrame({"id": idx, "prediction": pred})
+submission.to_csv("ensemble_6_39.csv", index=False)
